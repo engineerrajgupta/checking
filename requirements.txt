@@ -1,0 +1,14 @@
+# requirements.txt (Final Version)
+
+# --- Core Logic Dependencies ---
+langchain-google-genai
+python-dotenv
+PyMuPDF             # UPGRADED: Replaced PyPDF2 for better PDF parsing
+langchain
+requests
+numpy
+
+# --- FastAPI Server Dependencies ---
+fastapi
+uvicorn[standard]
+pydantic
