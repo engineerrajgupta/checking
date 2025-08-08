@@ -17,8 +17,8 @@ from db import db_pool # Using the connection pool
 # --- Load Environment Variables & Models ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.2)
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=api_key)
 
 # --- Database Setup (from db.py, called by main.py) ---
 def setup_database():
