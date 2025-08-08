@@ -5,8 +5,8 @@ import json
 import requests
 import io
 import fitz
-import hashlib # For creating a stable key for the cache
-import psycopg2 # For connecting to the PostgreSQL database
+import hashlib
+import psycopg2
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import CharacterTextSplitter
@@ -16,12 +16,11 @@ import numpy as np
 # --- Load Environment Variables & Models ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-# Render provides this automatically after you link the DB in the Environment tab
 DATABASE_URL = os.getenv("DATABASE_URL") 
 
 # Using your proven, high-scoring model combination
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=api_key)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
 
 # --- Database Setup Function ---
 def setup_database():
@@ -33,7 +32,6 @@ def setup_database():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        # Create table to store the results. Using JSONB is efficient for storing JSON.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS hackathon_cache (
                 cache_key CHAR(32) PRIMARY KEY,
@@ -50,10 +48,6 @@ def setup_database():
     finally:
         if conn:
             conn.close()
-
-# Call setup once when the application starts to ensure the table exists
-setup_database()
-
 
 # --- Core Logic Functions ---
 
@@ -143,11 +137,9 @@ def generate_structured_answer(context_with_sources, question):
 def process_document_and_questions(pdf_url, questions):
     """Main processing pipeline with the persistent database caching strategy."""
     
-    # Create a unique key for this request. Sorting ensures the order of questions doesn't matter.
     question_string = "".join(sorted(questions))
     cache_key = hashlib.md5((pdf_url + question_string).encode()).hexdigest()
     
-    # --- CACHE CHECK ---
     if DATABASE_URL:
         conn = None
         try:
@@ -165,7 +157,6 @@ def process_document_and_questions(pdf_url, questions):
     
     print(f"DATABASE CACHE MISS! Processing new request for key: {cache_key}")
     
-    # --- If not in cache, do the hard work ---
     documents = get_documents_from_pdf_url(pdf_url)
     if not documents: return {"answers": ["Failed to read PDF."] * len(questions)}
 
@@ -200,7 +191,6 @@ def process_document_and_questions(pdf_url, questions):
 
     final_response = {"answers": final_simple_answers}
     
-    # --- SAVE TO CACHE ---
     if DATABASE_URL:
         conn = None
         try:
