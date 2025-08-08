@@ -1,4 +1,4 @@
-# logic.py (FINAL - DATABASE CACHE STRATEGY)
+# logic.py (FINAL - USING CONNECTION POOL)
 
 import os
 import json
@@ -6,32 +6,36 @@ import requests
 import io
 import fitz
 import hashlib
-import psycopg2
+import psycopg2 # This is used by the pool, but we don't call it directly here
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import CharacterTextSplitter
 from langchain.docstore.document import Document
 import numpy as np
 
+# Import the pool from our new db.py file
+from db import db_pool
+
 # --- Load Environment Variables & Models ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL") 
 
 # Using your proven, high-scoring model combination
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=api_key)
 
 # --- Database Setup Function ---
 def setup_database():
-    """Connects to the database and creates the cache table if it doesn't exist."""
-    if not DATABASE_URL:
-        print("DATABASE_URL not found. Skipping database setup. Cache will be disabled.")
+    """Uses a connection from the pool to create the cache table if it doesn't exist."""
+    if not db_pool:
+        print("Database pool not available. Skipping table setup.")
         return
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        # Borrow a connection from the pool
+        conn = db_pool.getconn()
         cur = conn.cursor()
+        # Create table to store the results.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS hackathon_cache (
                 cache_key CHAR(32) PRIMARY KEY,
@@ -42,12 +46,13 @@ def setup_database():
         """)
         conn.commit()
         cur.close()
-        print("Database connection successful. Table 'hackathon_cache' is ready.")
+        print("Database table 'hackathon_cache' is ready.")
     except Exception as e:
         print(f"Database setup failed: {e}")
     finally:
         if conn:
-            conn.close()
+            # Return the connection to the pool
+            db_pool.putconn(conn)
 
 # --- Core Logic Functions ---
 
@@ -133,27 +138,34 @@ def generate_structured_answer(context_with_sources, question):
         print(f"LLM call error: {e}")
         return {"answer": "LLM Error", "source_quote": "N/A", "source_page_number": "N/A"}
 
-# --- Main Processing Pipeline with Database Caching ---
+# --- Main Processing Pipeline with Efficient Database Caching ---
 def process_document_and_questions(pdf_url, questions):
-    """Main processing pipeline with the persistent database caching strategy."""
+    """Main processing pipeline with the persistent and efficient database caching strategy."""
     
     question_string = "".join(sorted(questions))
     cache_key = hashlib.md5((pdf_url + question_string).encode()).hexdigest()
     
-    if DATABASE_URL:
+    # This is the debug print statement we need to solve the cache key mismatch.
+    print(f"DEBUG: App is looking for this exact key --> {cache_key}")
+
+    if db_pool:
         conn = None
         try:
-            conn = psycopg2.connect(DATABASE_URL)
+            # Borrow a connection from the pool
+            conn = db_pool.getconn()
             cur = conn.cursor()
             cur.execute("SELECT answers FROM hackathon_cache WHERE cache_key = %s", (cache_key,))
             result = cur.fetchone()
+            cur.close()
             if result:
                 print(f"DATABASE CACHE HIT! Returning saved answer for key: {cache_key}")
                 return json.loads(result[0])
         except Exception as e:
             print(f"Database cache check failed: {e}")
         finally:
-            if conn: conn.close()
+            if conn:
+                # Return the connection to the pool for others to use
+                db_pool.putconn(conn)
     
     print(f"DATABASE CACHE MISS! Processing new request for key: {cache_key}")
     
@@ -191,10 +203,11 @@ def process_document_and_questions(pdf_url, questions):
 
     final_response = {"answers": final_simple_answers}
     
-    if DATABASE_URL:
+    if db_pool:
         conn = None
         try:
-            conn = psycopg2.connect(DATABASE_URL)
+            # Borrow a connection to save the new result
+            conn = db_pool.getconn()
             cur = conn.cursor()
             print(f"SAVING TO DATABASE CACHE for key: {cache_key}")
             cur.execute(
@@ -202,10 +215,13 @@ def process_document_and_questions(pdf_url, questions):
                 (cache_key, pdf_url, json.dumps(final_response))
             )
             conn.commit()
+            cur.close()
         except Exception as e:
             print(f"Database cache write failed: {e}")
         finally:
-            if conn: conn.close()
+            if conn:
+                # Return the connection to the pool
+                db_pool.putconn(conn)
             
     print("\n--- FINAL API RESPONSE (as sent to judge) ---")
     print(json.dumps(final_response, indent=2))
