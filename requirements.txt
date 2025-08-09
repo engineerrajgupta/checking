@@ -1,5 +1,7 @@
 # requirements.txt
 
+faiss-cpu
+langchain-community
 # Core Logic Dependencies
 langchain-google-genai
 python-dotenv
