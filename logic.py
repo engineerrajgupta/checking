@@ -1,4 +1,4 @@
-# logic.py (FINAL - BULLETPROOF)
+# logic.py (FINAL - JSON PARSING FIX)
 
 import os
 import json
@@ -11,7 +11,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_text_splitters import CharacterTextSplitter
 from langchain.docstore.document import Document
 import numpy as np
-from db import db_pool # Import the pool from our new db.py file
+from db import db_pool
 
 # --- Load Environment Variables & Models ---
 load_dotenv()
@@ -21,7 +21,6 @@ embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_a
 
 # --- Database Setup Function ---
 def setup_database():
-    """Uses a connection from the pool to create the cache table if it doesn't exist."""
     if not db_pool:
         print("Database pool not available. Skipping table setup.")
         return
@@ -49,7 +48,6 @@ def setup_database():
 # --- Core Logic Functions ---
 
 def get_documents_from_pdf_url(pdf_url):
-    """Downloads and parses the PDF using the robust PyMuPDF library."""
     try:
         print(f"Downloading PDF from: {pdf_url}")
         response = requests.get(pdf_url)
@@ -63,14 +61,12 @@ def get_documents_from_pdf_url(pdf_url):
         return None
 
 def get_text_chunks(documents):
-    """Splits Document objects into smaller chunks for processing."""
     text_splitter = CharacterTextSplitter(
         separator="\n", chunk_size=1200, chunk_overlap=200, length_function=len
     )
     return text_splitter.split_documents(documents)
 
 def llm_parser_extract_query_topic(user_question):
-    """Uses the LLM to parse the user's question and extract the core topic."""
     prompt = f"""
     You are an expert at identifying the core subject of a question.
     Analyze the following user question and extract its main topic for semantic search.
@@ -87,7 +83,6 @@ def llm_parser_extract_query_topic(user_question):
         return user_question
 
 def generate_structured_answer(context_with_sources, question):
-    """Generates a structured JSON answer using your proven, high-performance prompt."""
     prompt = f"""
     You are a highly intelligent logic engine for analyzing legal and insurance documents.
     Your task is to answer the user's question based STRICTLY on the provided context.
@@ -130,10 +125,8 @@ def generate_structured_answer(context_with_sources, question):
         print(f"LLM call error: {e}")
         return {"answer": "LLM Error", "source_quote": "N/A", "source_page_number": "N/A"}
 
-# --- Main Processing Pipeline with the Connection Pool Bug Fix ---
+# --- Main Processing Pipeline with the Final Bug Fix ---
 def process_document_and_questions(pdf_url, questions):
-    """Main processing pipeline with the persistent and efficient database caching strategy."""
-    
     question_string = "".join(sorted(questions))
     cache_key = hashlib.md5((pdf_url + question_string).encode()).hexdigest()
     
@@ -150,7 +143,9 @@ def process_document_and_questions(pdf_url, questions):
             cur.close()
             if result:
                 print(f"DATABASE CACHE HIT! Returning saved answer for key: {cache_key}")
-                result_to_return = json.loads(result[0])
+                # THE FIX: The database driver already returns a Python dict for JSONB columns.
+                # We do NOT need to parse it again.
+                result_to_return = result[0]
         except Exception as e:
             print(f"Database cache check failed: {e}")
         finally:
@@ -202,6 +197,7 @@ def process_document_and_questions(pdf_url, questions):
             conn = db_pool.getconn()
             cur = conn.cursor()
             print(f"SAVING TO DATABASE CACHE for key: {cache_key}")
+            # When we save, we must provide a valid JSON string
             cur.execute(
                 "INSERT INTO hackathon_cache (cache_key, pdf_url, answers) VALUES (%s, %s, %s) ON CONFLICT (cache_key) DO NOTHING",
                 (cache_key, pdf_url, json.dumps(final_response))
