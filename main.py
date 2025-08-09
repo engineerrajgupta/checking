@@ -1,4 +1,4 @@
-# main.py (FINAL - WITH CONNECTION POOL)
+# main.py (FINAL - BULLETPROOF)
 
 import uvicorn
 from fastapi import FastAPI
@@ -25,7 +25,8 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Intelligent Query-Retrieval API",
-    version="13.0.0-connection-pool-fix",
+    description="An API that uses a persistent, connection-pooled database cache.",
+    version="14.0.0-bulletproof",
     lifespan=lifespan
 )
 
