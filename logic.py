@@ -1,4 +1,4 @@
-# logic.py (FINAL - HYBRID PARSER + DATABASE CACHE)
+# logic.py (FINAL - BULLETPROOF)
 
 import os
 import json
@@ -6,21 +6,20 @@ import requests
 import io
 import fitz
 import hashlib
-import base64 # For Vision API
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import CharacterTextSplitter
 from langchain.docstore.document import Document
 import numpy as np
-from db import db_pool # Using the connection pool
+from db import db_pool # Import the pool from our new db.py file
 
 # --- Load Environment Variables & Models ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.2)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=api_key)
 
-# --- Database Setup (from db.py, called by main.py) ---
+# --- Database Setup Function ---
 def setup_database():
     """Uses a connection from the pool to create the cache table if it doesn't exist."""
     if not db_pool:
@@ -47,57 +46,22 @@ def setup_database():
         if conn:
             db_pool.putconn(conn)
 
-# --- THE HYBRID PARSER (Prevents Crashes) ---
+# --- Core Logic Functions ---
+
 def get_documents_from_pdf_url(pdf_url):
-    """
-    Downloads and intelligently parses a PDF. It first tries a fast text extraction.
-    If it detects a scanned/image-based PDF, it falls back to the powerful Vision API.
-    """
+    """Downloads and parses the PDF using the robust PyMuPDF library."""
     try:
         print(f"Downloading PDF from: {pdf_url}")
         response = requests.get(pdf_url)
         response.raise_for_status()
-        pdf_bytes = response.content
-        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-        documents = []
-        total_text_length = 0
-        for i, page in enumerate(pdf_doc):
-            text = page.get_text("text", sort=True)
-            total_text_length += len(text)
-            if text:
-                documents.append(Document(page_content=text, metadata={"source_page": i + 1}))
-        
-        # Heuristic: If the average characters per page is less than 100, it's likely a scan.
-        if len(pdf_doc) > 0 and total_text_length / len(pdf_doc) < 100:
-            print(f"LOW TEXT DETECTED ({total_text_length} chars / {len(pdf_doc)} pages). Falling back to Vision API.")
-            documents = [] # Discard the garbage text
-            for i, page in enumerate(pdf_doc):
-                pix = page.get_pixmap(dpi=200)
-                img_bytes = pix.tobytes("jpeg")
-                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                
-                # Use the 'llm' object which is gemini-1.5-flash, it can handle vision too
-                response = llm.invoke([
-                    {"role": "user", "content": [
-                        {"type": "text", "text": "Extract all text from this document page. Preserve layout."},
-                        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{img_base64}"}
-                    ]}
-                ])
-                page_text = response.content
-                if page_text:
-                    documents.append(Document(page_content=page_text, metadata={"source_page": i + 1}))
-            print("Vision processing complete.")
-        else:
-            print("Standard text extraction successful.")
-        
+        pdf_doc = fitz.open(stream=response.content, filetype="pdf")
+        documents = [Document(page_content=page.get_text(), metadata={"source_page": i + 1}) for i, page in enumerate(pdf_doc) if page.get_text()]
         pdf_doc.close()
         return documents
     except Exception as e:
         print(f"Error processing PDF: {e}")
         return None
 
-# --- Your Proven Logic (Unchanged) ---
 def get_text_chunks(documents):
     """Splits Document objects into smaller chunks for processing."""
     text_splitter = CharacterTextSplitter(
