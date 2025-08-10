@@ -4,6 +4,7 @@ python-dotenv
 requests
 pymupdf
 numpy
+faiss-cpu
 langchain-google-genai
 langchain
 psycopg2-binary
