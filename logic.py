@@ -1,6 +1,27 @@
-from urllib.parse import urlparse
+import os
+import json
+import requests
+import fitz
+import hashlib
+import numpy as np
 import re
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import CharacterTextSplitter
+from langchain.docstore.document import Document
+from db import db_pool
 
+# --- Load Environment Variables ---
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+
+# --- Models ---
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=api_key)
+
+
+# --- Helpers ---
 def normalize_pdf_url(url: str) -> str:
     """Remove query params and fragments from PDF URL for consistent caching."""
     parsed = urlparse(url)
@@ -11,8 +32,116 @@ def normalize_questions(questions: list[str]) -> list[str]:
     cleaned = [re.sub(r'\s+', ' ', q.strip().lower()) for q in questions]
     return sorted(cleaned)
 
+# --- Database Setup ---
+def setup_database():
+    if not db_pool:
+        print("Database pool not available. Skipping table setup.")
+        return
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS hackathon_cache (
+                cache_key CHAR(32) PRIMARY KEY,
+                pdf_url TEXT NOT NULL,
+                answers JSONB NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        print("Database table 'hackathon_cache' is ready.")
+    except Exception as e:
+        print(f"Database setup failed: {e}")
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+# --- PDF & LLM Functions ---
+def get_documents_from_pdf_url(pdf_url):
+    try:
+        print(f"Downloading PDF from: {pdf_url}")
+        response = requests.get(pdf_url)
+        response.raise_for_status()
+        pdf_doc = fitz.open(stream=response.content, filetype="pdf")
+        documents = [
+            Document(page_content=page.get_text(), metadata={"source_page": i + 1})
+            for i, page in enumerate(pdf_doc) if page.get_text()
+        ]
+        pdf_doc.close()
+        return documents
+    except Exception as e:
+        print(f"Error processing PDF: {e}")
+        return None
+
+def get_text_chunks(documents):
+    text_splitter = CharacterTextSplitter(
+        separator="\n", chunk_size=1200, chunk_overlap=200, length_function=len
+    )
+    return text_splitter.split_documents(documents)
+
+def llm_parser_extract_query_topic(user_question):
+    prompt = f"""
+    You are an expert at identifying the core subject of a question.
+    Analyze the following user question and extract its main topic for semantic search.
+    User question: "{user_question}"
+    Return a JSON object with a single key "query_topic".
+    Respond ONLY with the JSON object.
+    """
+    try:
+        response = llm.invoke(prompt)
+        json_string = response.content.strip().replace("```json", "").replace("```", "")
+        parsed_json = json.loads(json_string)
+        return parsed_json.get("query_topic", user_question)
+    except Exception:
+        return user_question
+
+def generate_structured_answer(context_with_sources, question):
+    prompt = f"""
+    You are a highly intelligent logic engine for analyzing legal and insurance documents.
+    Your task is to answer the user's question based STRICTLY on the provided context.
+    The context is a JSON object where keys are page numbers and values are the text from those pages.
+    You must generate a structured JSON response.
+
+    **Provided Context from Document:**
+    ---
+    {context_with_sources}
+    ---
+
+    **User's Question:**
+    ---
+    {question}
+    ---
+
+    **Your Task:**
+    1. Find the single most relevant page and quote that answers the question.
+    2. Generate a JSON object with the following schema:
+    {{
+      "question": "{question}",
+      "answer": "A concise, direct answer to the question.",
+      "source_quote": "The single, most relevant sentence from the context that directly supports your answer.",
+      "source_page_number": "The page number (as an integer) where the source_quote was found."
+    }}
+
+    If the information is not in the context, respond with this JSON structure:
+    {{
+      "question": "{question}",
+      "answer": "Information not found in the provided document context.",
+      "source_quote": "N/A",
+      "source_page_number": "N/A"
+    }}
+    """
+    try:
+        response = llm.invoke(prompt)
+        json_string = response.content.strip().replace("```json", "").replace("```", "")
+        return json.loads(json_string)
+    except Exception as e:
+        print(f"LLM call error: {e}")
+        return {"answer": "LLM Error", "source_quote": "N/A", "source_page_number": "N/A"}
+
+# --- Main Processing ---
 def process_document_and_questions(pdf_url, questions):
-    # --- Normalize input for consistent cache keys ---
     pdf_url_normalized = normalize_pdf_url(pdf_url)
     questions_normalized = normalize_questions(questions)
     question_string = "||".join(questions_normalized)
@@ -22,7 +151,7 @@ def process_document_and_questions(pdf_url, questions):
     print(f"DEBUG: Normalized Questions --> {questions_normalized}")
     print(f"DEBUG: Cache key --> {cache_key}")
 
-    # --- CACHE CHECK ---
+    # Cache check
     if db_pool:
         conn = None
         try:
@@ -30,12 +159,10 @@ def process_document_and_questions(pdf_url, questions):
             print(f"DEBUG: Connected to DB: {conn.dsn}")
 
             cur = conn.cursor()
-            # Debug: See all cache keys in DB
             cur.execute("SELECT cache_key FROM hackathon_cache")
             all_keys = [row[0] for row in cur.fetchall()]
             print(f"DEBUG: Keys in DB: {all_keys}")
 
-            # Try fetching our key
             cur.execute("SELECT answers FROM hackathon_cache WHERE cache_key = %s", (cache_key,))
             result = cur.fetchone()
             cur.close()
@@ -57,7 +184,6 @@ def process_document_and_questions(pdf_url, questions):
 
     print(f"DATABASE CACHE MISS! Processing new request for key: {cache_key}")
 
-    # === Normal processing (unchanged) ===
     documents = get_documents_from_pdf_url(pdf_url)
     if not documents:
         return {"answers": ["Failed to read PDF."] * len(questions)}
@@ -98,16 +224,15 @@ def process_document_and_questions(pdf_url, questions):
 
     final_response = {"answers": final_simple_answers}
 
-    # --- SAVE TO CACHE ---
+    # Save to DB
     if db_pool:
         conn = None
         try:
             conn = db_pool.getconn()
-            conn.autocommit = True  # Ensure immediate commit
+            conn.autocommit = True
             print(f"DEBUG: Writing to DB: {conn.dsn}")
 
             cur = conn.cursor()
-            print(f"SAVING TO DATABASE CACHE for key: {cache_key}")
             cur.execute(
                 """
                 INSERT INTO hackathon_cache (cache_key, pdf_url, answers)
@@ -116,6 +241,7 @@ def process_document_and_questions(pdf_url, questions):
                 """,
                 (cache_key, pdf_url_normalized, json.dumps(final_response))
             )
+
             # Verify insert
             cur.execute("SELECT 1 FROM hackathon_cache WHERE cache_key = %s", (cache_key,))
             if cur.fetchone():
