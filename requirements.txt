@@ -5,6 +5,7 @@ requests
 pymupdf
 numpy
 faiss-cpu
+langchain
 langchain-google-genai
 langchain-text-splitters
 psycopg2-binary
