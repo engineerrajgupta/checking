@@ -1,459 +1,479 @@
-# logic.py
+"""
+logic.py
+
+- Preprocess PDF -> build FAISS index (persisted to disk)
+- Query endpoint uses existing FAISS index to retrieve context and call Gemini LLM
+- Uses SQLite to track preprocessing status and optionally cache final answers
+"""
+# import gemini
 import os
-import io
-import json
-import re
 import hashlib
+import json
 import pickle
 import requests
-import fitz
+import time
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+
 import numpy as np
 import faiss
-from urllib.parse import urlparse
-from dotenv import load_dotenv
-from typing import List, Dict, Any
+import fitz  # pymupdf
 
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import CharacterTextSplitter
-from langchain.docstore.document import Document
 
-from db import db_pool  # expects your db.py to provide db_pool SimpleConnectionPool
+import sqlite3
+import threading
 
 load_dotenv()
 
-# --------- Configuration ---------
+# -------------------------
+# Configuration
+# -------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY not set in environment.")
+    print("WARNING: GEMINI_API_KEY not set. Set env var GEMINI_API_KEY to use Gemini.")
 
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
+# Models
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-pro-preview-06-05")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")  # embedding model (must be an embedding-capable model)
 
-# Where to persist per-PDF FAISS indexes & metadata
-FAISS_DIR = os.getenv("FAISS_DIR", "faiss_indexes")
-PDF_CACHE_DIR = os.getenv("PDF_CACHE_DIR", "pdf_cache")
+# Local persistence directories (customize via env)
+FAISS_DIR = os.getenv("FAISS_DIR", "/tmp/faiss_cache")
+PDF_DIR = os.getenv("PDF_DIR", "/tmp/pdf_cache")
+META_DIR = os.getenv("META_DIR", "/tmp/faiss_meta")
 os.makedirs(FAISS_DIR, exist_ok=True)
-os.makedirs(PDF_CACHE_DIR, exist_ok=True)
+os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs(META_DIR, exist_ok=True)
 
-# instantiate models
+# sqlite DB for status & optional cache
+SQLITE_DB = os.getenv("SQLITE_DB", "/tmp/faiss_status.db")
+
+# instantiate Gemini models via langchain_google_genai adapter
 llm = ChatGoogleGenerativeAI(model=LLM_MODEL, google_api_key=GEMINI_API_KEY, temperature=0)
 embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=GEMINI_API_KEY)
 
-# --------- Helpers ---------
-def normalize_pdf_url(url: str) -> str:
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-def extract_file_name_from_url(url: str) -> str:
-    parsed = urlparse(url)
-    return os.path.basename(parsed.path) or "document.pdf"
+# -------------------------
+# SQLite helper (status + simple cache)
+# -------------------------
+def init_sqlite():
+    conn = sqlite3.connect(SQLITE_DB, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_status (
+            pdf_hash TEXT PRIMARY KEY,
+            pdf_url TEXT,
+            status TEXT,         -- pending | processing | done | failed
+            updated_at REAL
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answer_cache (
+            key TEXT PRIMARY KEY,   -- md5(pdf_hash + question)
+            pdf_hash TEXT,
+            question TEXT,
+            answer TEXT,
+            created_at REAL
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def normalize_questions(questions: List[str]) -> List[str]:
-    cleaned = [re.sub(r'\s+', ' ', q.strip().lower()) for q in questions]
-    return sorted(cleaned)
 
+init_sqlite()
+
+
+def set_pdf_status(pdf_hash: str, pdf_url: str, status: str):
+    conn = sqlite3.connect(SQLITE_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO pdf_status (pdf_hash, pdf_url, status, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(pdf_hash) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at, pdf_url = excluded.pdf_url",
+        (pdf_hash, pdf_url, status, time.time()),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_pdf_status(pdf_hash: str) -> Optional[str]:
+    conn = sqlite3.connect(SQLITE_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM pdf_status WHERE pdf_hash = ?", (pdf_hash,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else None
+
+
+def cache_answer(pdf_hash: str, question: str, answer: str):
+    key = hashlib.md5((pdf_hash + question).encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(SQLITE_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO answer_cache (key, pdf_hash, question, answer, created_at) VALUES (?, ?, ?, ?, ?)",
+        (key, pdf_hash, question, answer, time.time())
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_cached_answer(pdf_hash: str, question: str) -> Optional[str]:
+    key = hashlib.md5((pdf_hash + question).encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(SQLITE_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT answer FROM answer_cache WHERE key = ?", (key,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else None
+
+
+# -------------------------
+# Utilities: file naming / hashing
+# -------------------------
 def md5_hex(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-# --------- PDF download & parsing ---------
-def download_pdf_if_needed(pdf_url: str) -> str:
-    """
-    Download the pdf to PDF_CACHE_DIR and return local path.
-    Uses md5(filename) as storage filename to handle query strings.
-    """
-    normalized = normalize_pdf_url(pdf_url)
-    file_hash = md5_hex(normalized)
-    filename = f"{file_hash}.pdf"
-    local_path = os.path.join(PDF_CACHE_DIR, filename)
-    if os.path.exists(local_path):
-        print(f"Using cached PDF file at {local_path}")
-        return local_path
 
+def pdf_hash_for_url(pdf_url: str) -> str:
+    # normalize by dropping query params (so same PDF path with signed URLs maps to same hash)
+    from urllib.parse import urlparse
+    p = urlparse(pdf_url)
+    normalized = f"{p.scheme}://{p.netloc}{p.path}"
+    return md5_hex(normalized)
+
+
+def local_pdf_path(pdf_hash: str) -> str:
+    return os.path.join(PDF_DIR, f"{pdf_hash}.pdf")
+
+
+def faiss_index_paths(pdf_hash: str):
+    index_path = os.path.join(FAISS_DIR, f"{pdf_hash}.index")
+    meta_path = os.path.join(META_DIR, f"{pdf_hash}.meta.pkl")
+    return index_path, meta_path
+
+
+# -------------------------
+# PDF download & parse
+# -------------------------
+def download_pdf(pdf_url: str, pdf_hash: str) -> Optional[str]:
+    local_path = local_pdf_path(pdf_hash)
+    if os.path.exists(local_path):
+        return local_path
     try:
-        print(f"Downloading PDF from: {pdf_url}")
-        resp = requests.get(pdf_url, timeout=60)
+        resp = requests.get(pdf_url, timeout=60, stream=True)
         resp.raise_for_status()
         with open(local_path, "wb") as f:
-            f.write(resp.content)
-        print(f"Saved PDF to {local_path}")
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
         return local_path
     except Exception as e:
-        print(f"Error downloading PDF: {e}")
+        print("download_pdf error:", e)
         if os.path.exists(local_path):
             os.remove(local_path)
         return None
 
-def extract_documents_from_pdf(local_pdf_path: str) -> List[Document]:
+
+def extract_text_chunks_from_pdf(local_pdf: str, chunk_size: int = 1200, chunk_overlap: int = 200) -> List[Dict[str, Any]]:
+    """
+    Returns list of dicts: {"text": "...", "page": page_no}
+    Uses PyMuPDF (fitz) which is robust.
+    """
+    res = []
     try:
-        pdf_doc = fitz.open(local_pdf_path)
-        documents = [
-            Document(page_content=page.get_text(), metadata={"source_page": i + 1})
-            for i, page in enumerate(pdf_doc) if page.get_text().strip()
-        ]
-        pdf_doc.close()
-        return documents
+        doc = fitz.open(local_pdf)
+        for i, page in enumerate(doc):
+            text = page.get_text().strip()
+            if not text:
+                continue
+            # naive chunking by characters using CharacterTextSplitter style
+            # but we'll do simple sliding windows on the page text (could be improved)
+            start = 0
+            while start < len(text):
+                piece = text[start:start + chunk_size]
+                res.append({"text": piece, "page": i + 1})
+                start += (chunk_size - chunk_overlap)
+        doc.close()
     except Exception as e:
-        print(f"Error parsing PDF {local_pdf_path}: {e}")
-        return []
+        print("extract_text_chunks_from_pdf error:", e)
+    return res
 
-# --------- Text chunking ---------
-def get_text_chunks_from_documents(documents: List[Document], chunk_size=1200, chunk_overlap=200) -> List[Document]:
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len
-    )
-    return text_splitter.split_documents(documents)
 
-# --------- FAISS index persistence helpers ---------
-def faiss_paths_for_pdf_hash(pdf_hash: str):
-    index_path = os.path.join(FAISS_DIR, f"{pdf_hash}.index")
-    meta_path = os.path.join(FAISS_DIR, f"{pdf_hash}.meta.pkl")
-    return index_path, meta_path
+# -------------------------
+# FAISS build/load/save
+# -------------------------
+def build_faiss_for_pdf(pdf_hash: str, chunk_texts: List[str]) -> Optional[faiss.Index]:
+    """
+    Takes list of raw chunk strings and returns a FAISS Index (IP over normalized vectors).
+    Also returns metadata saved to meta_path.
+    """
+    try:
+        # compute embeddings via Google embedding model
+        print(f"[embedding] computing {len(chunk_texts)} embeddings...")
+        emb_list = embeddings.embed_documents(chunk_texts)  # list of vectors
+        arr = np.array(emb_list).astype("float32")
+        # normalize vectors
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-9
+        arr_norm = arr / norms
+        d = arr_norm.shape[1]
+        index = faiss.IndexFlatIP(d)
+        index.add(arr_norm)
+        return index, arr_norm
+    except Exception as e:
+        print("build_faiss_for_pdf embedding/index error:", e)
+        return None, None
 
-def save_faiss_index(index: faiss.Index, metadata: List[dict], pdf_hash: str):
-    index_path, meta_path = faiss_paths_for_pdf_hash(pdf_hash)
+
+def save_faiss_index_and_meta(index: faiss.Index, meta: List[dict], pdf_hash: str):
+    index_path, meta_path = faiss_index_paths(pdf_hash)
     faiss.write_index(index, index_path)
     with open(meta_path, "wb") as f:
-        pickle.dump(metadata, f)
-    print(f"Saved FAISS index to {index_path} and metadata to {meta_path}")
+        pickle.dump(meta, f)
+    print(f"[faiss] saved index: {index_path}, meta: {meta_path}")
 
-def load_faiss_index(pdf_hash: str):
-    index_path, meta_path = faiss_paths_for_pdf_hash(pdf_hash)
-    if not os.path.exists(index_path) or not os.path.exists(meta_path):
+
+def load_faiss_index_and_meta(pdf_hash: str):
+    index_path, meta_path = faiss_index_paths(pdf_hash)
+    if not (os.path.exists(index_path) and os.path.exists(meta_path)):
         return None, None
     try:
         index = faiss.read_index(index_path)
         with open(meta_path, "rb") as f:
-            metadata = pickle.load(f)
-        print(f"Loaded FAISS index from {index_path}")
-        return index, metadata
+            meta = pickle.load(f)
+        return index, meta
     except Exception as e:
-        print(f"Failed to load FAISS index: {e}")
+        print("load_faiss_index_and_meta error:", e)
         return None, None
 
-# --------- Build FAISS index (cosine via inner-product of L2-normalized vectors) ---------
-def build_faiss_index(embeddings_list: List[List[float]]):
-    arr = np.array(embeddings_list).astype("float32")
-    # normalize each vector (L2)
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms[norms == 0] = 1e-9
-    arr_norm = arr / norms
-    d = arr_norm.shape[1]
-    index = faiss.IndexFlatIP(d)  # inner-product -> works as cosine after normalization
-    index.add(arr_norm)
-    return index, arr_norm
 
-# --------- FAISS search helper ---------
-def search_faiss(index: faiss.Index, query_vector: List[float], top_k: int = 5):
-    q = np.array(query_vector).astype("float32")
+# -------------------------
+# Preprocessing pipeline (blocking)
+# -------------------------
+def preprocess_pdf_blocking(pdf_url: str):
+    """
+    Full preprocessing pipeline:
+      - set status processing
+      - download PDF
+      - extract chunks
+      - embed and build FAISS
+      - save index + meta
+      - set status done
+    This function is BLOCKING and may take time for large PDFs.
+    Call it in a worker or manually via /preprocess.
+    """
+    pdf_hash = pdf_hash_for_url(pdf_url)
+    set_pdf_status(pdf_hash, pdf_url, "processing")
+    print(f"[preprocess] starting for {pdf_url} (hash={pdf_hash})")
+
+    local_pdf = download_pdf(pdf_url, pdf_hash)
+    if not local_pdf:
+        set_pdf_status(pdf_hash, pdf_url, "failed")
+        return {"status": "failed", "reason": "download_failed"}
+
+    # extract text chunks
+    chunks_meta = extract_text_chunks_from_pdf(local_pdf)
+    if not chunks_meta:
+        # no text extracted - mark done but with empty index (you may choose to special-case image PDFs)
+        set_pdf_status(pdf_hash, pdf_url, "failed")
+        return {"status": "failed", "reason": "no_text_extracted"}
+
+    chunk_texts = [c["text"] for c in chunks_meta]
+
+    index, arr_norm = build_faiss_for_pdf(pdf_hash, chunk_texts)
+    if index is None:
+        set_pdf_status(pdf_hash, pdf_url, "failed")
+        return {"status": "failed", "reason": "embedding_error"}
+
+    # prepare metadata list (text + page)
+    meta_list = []
+    for i, c in enumerate(chunks_meta):
+        meta = {"page": c["page"], "text": c["text"]}
+        meta_list.append(meta)
+
+    # persist
+    save_faiss_index_and_meta(index, meta_list, pdf_hash)
+    set_pdf_status(pdf_hash, pdf_url, "done")
+    return {"status": "done"}
+
+
+# -------------------------
+# Retrieval + LLM answering
+# -------------------------
+def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
+    index, meta = load_faiss_index_and_meta(pdf_hash)
+    if not index or not meta:
+        return []
+
+    # embed query
+    try:
+        q_emb = embeddings.embed_query(query)
+    except Exception as e:
+        print("retrieve_top_k_for_query embed error:", e)
+        q_emb = embeddings.embed_query(query)  # try again, may raise
+
+    q = np.array(q_emb).astype("float32")
     q = q / (np.linalg.norm(q) + 1e-9)
     D, I = index.search(q.reshape(1, -1), top_k)
-    return I[0].tolist(), D[0].tolist()
+    ids = I[0].tolist()
+    scores = D[0].tolist()
+    results = []
+    for idx, score in zip(ids, scores):
+        if idx < 0 or idx >= len(meta):
+            continue
+        results.append({"score": float(score), "page": meta[idx].get("page"), "text": meta[idx].get("text")})
+    return results
 
-# --------- LLM prompts / structured answer ----------
-def llm_parser_extract_query_topic(user_question: str) -> str:
+
+def prompt_for_gemini_with_context(context_items: List[dict], question: str) -> str:
+    """
+    Build a prompt containing the top-k contexts (with page numbers) and the user's question.
+    """
+    ctx_parts = []
+    for i, it in enumerate(context_items):
+        ctx_parts.append(f"--- Context {i+1} (page {it.get('page', 'Unknown')}) ---\n{it.get('text','')}\n")
+    ctx_text = "\n".join(ctx_parts)
     prompt = f"""
-You are an expert at identifying the core subject of a question.
-Analyze the following user question and extract its main topic for semantic search.
-User question: "{user_question}"
-Return a JSON object with a single key "query_topic".
-Respond ONLY with the JSON object.
-"""
-    try:
-        response = llm.invoke(prompt)
-        json_string = response.content.strip().replace("```json", "").replace("```", "")
-        parsed = json.loads(json_string)
-        return parsed.get("query_topic", user_question)
-    except Exception:
-        return user_question
+You are a precise assistant. Answer the user's question strictly using the provided document context below.
+Do not invent facts outside the context. If the answer is not present in context, say "Information not found in the document".
 
-def generate_structured_answer(context_with_sources: str, question: str) -> dict:
-    prompt = f"""
-You are a highly intelligent logic engine for analyzing legal and insurance documents.
-Your task is to answer the user's question based STRICTLY on the provided context.
-The context is a JSON object where keys are page numbers and values are the text from those pages.
-You must generate a structured JSON response.
+Context:
+{ctx_text}
 
-**Provided Context from Document:**
----
-{context_with_sources}
----
-
-**User's Question:**
----
+Question:
 {question}
----
 
-**Your Task:**
-1. Find the single most relevant page and quote that answers the question.
-2. Generate a JSON object with the following schema:
-{{
-  "question": "{question}",
-  "answer": "A concise, direct answer to the question.",
-  "source_quote": "The single, most relevant sentence from the context that directly supports your answer.",
-  "source_page_number": "The page number (as an integer) where the source_quote was found."
-}}
-
-If the information is not in the context, respond with this JSON structure:
-{{
-  "question": "{question}",
-  "answer": "Information not found in the provided document context.",
-  "source_quote": "N/A",
-  "source_page_number": "N/A"
-}}
+Provide a JSON object with keys: "question", "answer", "source_quote", "source_page_number"
+- "answer" should be concise.
+- "source_quote" should be the single sentence from the context that supports the answer (or "N/A").
+- "source_page_number" should be the page number (or "N/A").
+Return ONLY the JSON object.
 """
-    try:
-        response = llm.invoke(prompt)
-        json_string = response.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(json_string)
-    except Exception as e:
-        print(f"LLM call error: {e}")
-        return {"question": question, "answer": "LLM Error", "source_quote": "N/A", "source_page_number": "N/A"}
+    return prompt
 
-# --------- DB caching helpers (Postgres JSONB) ----------
-def ensure_cache_table_exists():
-    if not db_pool:
-        print("DB pool not initialized, skipping table ensure.")
-        return
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS hackathon_cache (
-                cache_key CHAR(32) PRIMARY KEY,
-                pdf_url TEXT NOT NULL,
-                file_name TEXT,
-                answers JSONB NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.commit()
-        # Add file_name column if missing (idempotent)
-        cur.execute("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='hackathon_cache' AND column_name='file_name'
-                ) THEN
-                    ALTER TABLE hackathon_cache ADD COLUMN file_name TEXT;
-                END IF;
-            END$$;
-        """)
-        conn.commit()
-        cur.close()
-    except Exception as e:
-        print(f"Error ensuring cache table: {e}")
-    finally:
-        if conn:
-            db_pool.putconn(conn)
 
-def fetch_from_cache(cache_key: str):
-    if not db_pool:
-        return None
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        cur = conn.cursor()
-        print(f"DEBUG: Running SELECT for cache_key={cache_key}")
-        cur.execute("SELECT answers FROM hackathon_cache WHERE cache_key = %s", (cache_key,))
-        row = cur.fetchone()
-        cur.close()
-        if row:
-            data = row[0]
-            # If driver returns string for JSONB, parse it
-            if isinstance(data, str):
-                try:
-                    data = json.loads(data)
-                except Exception:
-                    print("Warning: Could not parse JSONB string from DB.")
-            return data
-        return None
-    except Exception as e:
-        print(f"DB fetch error: {e}")
-        return None
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
+    pdf_hash = pdf_hash_for_url(pdf_url)
+    status = get_pdf_status(pdf_hash)
 
-def save_to_cache(cache_key: str, pdf_url: str, file_name: str, final_response: dict):
-    if not db_pool:
-        print("DB pool not available; not saving cache.")
-        return
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        conn.autocommit = True
-        cur = conn.cursor()
-        print(f"DEBUG: Inserting cache_key={cache_key} into DB")
-        cur.execute(
-            """
-            INSERT INTO hackathon_cache (cache_key, pdf_url, file_name, answers)
-            VALUES (%s, %s, %s, %s::jsonb)
-            ON CONFLICT (cache_key) DO UPDATE
-              SET answers = EXCLUDED.answers,
-                  pdf_url = EXCLUDED.pdf_url,
-                  file_name = EXCLUDED.file_name,
-                  created_at = CURRENT_TIMESTAMP
-            """,
-            (cache_key, pdf_url, file_name, json.dumps(final_response))
-        )
-        # verify insert
-        cur.execute("SELECT 1 FROM hackathon_cache WHERE cache_key = %s", (cache_key,))
-        ok = cur.fetchone()
-        if ok:
-            print(f"DEBUG: Cache saved / exists for key={cache_key}")
-        else:
-            print(f"ERROR: Cache verification failed for key={cache_key}")
-        cur.close()
-    except Exception as e:
-        print(f"DB save error: {e}")
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+    if status != "done":
+        return {
+            "processing": True,
+            "status": status or "not_started",
+            "message": "Preprocess the PDF first via /preprocess"
+        }
 
-# --------- Main processing pipeline ----------
+    answers = []
+
+    for q in questions:
+        # Try cache first
+        cached = get_cached_answer(pdf_hash, q)
+        if cached:
+            answers.append(cached)
+            continue
+
+        # Retrieve top-k chunks
+        top = retrieve_top_k_for_query(pdf_hash, q, top_k=5)
+        if not top:
+            answers.append("No context found in document.")
+            continue
+
+        # Build prompt and invoke Gemini
+        prompt = prompt_for_gemini_with_context(top, q)
+        try:
+            r = llm.invoke(prompt)
+            json_text = r.content.strip().replace("```json", "").replace("```", "")
+            parsed = json.loads(json_text)
+            answer_text = parsed.get("answer") or parsed.get("Answer") or json_text
+        except Exception as e:
+            print("LLM call error:", e)
+            answer_text = "LLM call failed; see logs."
+
+        # Cache result and add to answers list
+        cache_answer(pdf_hash, q, answer_text)
+        answers.append(answer_text)
+
+    return {"answers": answers}
+
+
+# -------------------------
+# Convenience wrapper for running preprocess in a thread (for local/developer use only)
+# -------------------------
+def start_preprocess_in_background(pdf_url: str) -> Dict[str, Any]:
+    pdf_hash = pdf_hash_for_url(pdf_url)
+    status = get_pdf_status(pdf_hash)
+    if status == "processing":
+        return {"status": "processing", "message": "Already processing"}
+
+    # mark and spawn thread
+    set_pdf_status(pdf_hash, pdf_url, "pending")
+
+    def target():
+        try:
+            set_pdf_status(pdf_hash, pdf_url, "processing")
+            preprocess_pdf_blocking(pdf_url)
+        except Exception as e:
+            print("Background preprocess error:", e)
+            set_pdf_status(pdf_hash, pdf_url, "failed")
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    return {"status": "started", "pdf_hash": pdf_hash}
+
+
+# -------------------------
+# Public functions expected by main.py
+# -------------------------
+def preprocess_pdf(pdf_url: str, background: bool = False) -> Dict[str, Any]:
+    """
+    If background==False -> run blocking preprocess (callable from worker)
+    If background==True  -> attempt to start background thread (may not persist in serverless)
+    """
+    if background:
+        return start_preprocess_in_background(pdf_url)
+    return preprocess_pdf_blocking(pdf_url)
+
+
+def answer_pdf_questions(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
+    """
+    Returns either "processing" status or the answers.
+    """
+    return answer_questions_using_index(pdf_url, questions)
+
+
+# If run as script, quick CLI:
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--preprocess", help="PDF URL to preprocess", default=None)
+    p.add_argument("--ask", help="PDF URL to ask against", default=None)
+    p.add_argument("--question", help="Question (for ask)", default=None)
+    args = p.parse_args()
+    if args.preprocess:
+        print(preprocess_pdf(args.preprocess, background=False))
+    elif args.ask and args.question:
+        print(answer_pdf_questions(args.ask, [args.question]))
+    else:
+        print("Usage examples:\n  python logic.py --preprocess 'https://...' \n  python logic.py --ask 'https://...' --question 'Who wrote it?'")
+
 def process_document_and_questions(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
     """
-    Main entrypoint.
-    pdf_url: URL to PDF
-    questions: list of user questions
-    returns: {"answers": [ ... ]} where each answer is a concise string
+    Combined function to preprocess and then answer questions.
     """
-    # normalize inputs
-    pdf_url_normalized = normalize_pdf_url(pdf_url)
-    file_name = extract_file_name_from_url(pdf_url)
-    questions_normalized = normalize_questions(questions)
-    question_string = "||".join(questions_normalized)
-    cache_key = md5_hex(pdf_url_normalized + question_string)
+    preprocess_result = preprocess_pdf(pdf_url, background=False)
 
-    print(f"DEBUG: Normalized URL --> {pdf_url_normalized}")
-    print(f"DEBUG: File name --> {file_name}")
-    print(f"DEBUG: Normalized Questions --> {questions_normalized}")
-    print(f"DEBUG: Cache key --> {cache_key}")
+    # Check if preprocessing failed
+    if preprocess_result.get("status") == "failed":
+        return {"error": f"Preprocessing failed: {preprocess_result.get('reason', 'unknown')}"}
 
-    # ensure DB table exists
-    ensure_cache_table_exists()
-
-    # 1) Try cache
-    cached = fetch_from_cache(cache_key)
-    if cached:
-        print(f"DATABASE CACHE HIT! Returning saved answer for key: {cache_key}")
-        return cached
-
-    print(f"DATABASE CACHE MISS! Processing new request for key: {cache_key}")
-
-    # 2) Ensure PDF is downloaded locally
-    local_pdf = download_pdf_if_needed(pdf_url)
-    if not local_pdf:
-        return {"answers": ["Failed to download PDF."] * len(questions)}
-
-    # 3) Try loading existing FAISS index for this PDF
-    pdf_hash = md5_hex(normalize_pdf_url(pdf_url))
-    index, metadata = load_faiss_index(pdf_hash)
-
-    chunk_texts = []
-    chunk_metadata = []
-
-    if index is None:
-        # Need to parse PDF, chunk text, embed, and build index
-        documents = extract_documents_from_pdf(local_pdf)
-        if not documents:
-            return {"answers": ["Failed to parse PDF."] * len(questions)}
-
-        text_chunks = get_text_chunks_from_documents(documents)
-        if not text_chunks:
-            return {"answers": ["Failed to chunk text."] * len(questions)}
-
-        # Keep chunk_texts and metadata lists aligned with embeddings
-        chunk_texts = [chunk.page_content for chunk in text_chunks]
-        chunk_metadata = [ {"source_page": chunk.metadata.get("source_page", "Unknown")} for chunk in text_chunks ]
-
-        # compute embeddings via Gemini embeddings model
-        try:
-            print("Computing embeddings for document chunks...")
-            chunk_embeddings = embeddings.embed_documents(chunk_texts)
-            # build faiss index
-            index, _ = build_faiss_index(chunk_embeddings)
-            metadata = chunk_metadata
-            save_faiss_index(index, metadata, pdf_hash)
-        except Exception as e:
-            print(f"Embedding / FAISS build error: {e}")
-            return {"answers": ["Embedding/FAISS build failed."] * len(questions)}
-    else:
-        # Load chunk_texts and metadata from disk metadata
-        chunk_texts = []
-        # metadata is already loaded and contains source_page per chunk
-        # we need the actual text chunks: we stored only metadata above, so we must load chunk texts too
-        # To keep it simple, we persist chunk_texts inside metadata as well during save.
-        # If metadata contains 'text' per chunk, use it; else we cannot reconstruct chunk texts
-        if metadata and isinstance(metadata, list) and "text" in metadata[0]:
-            chunk_texts = [m.get("text", "") for m in metadata]
-        else:
-            # Not having chunk text in metadata — fallback: re-parse & re-embed (safer)
-            print("Metadata does not include chunk text; reparsing PDF to rebuild embeddings.")
-            documents = extract_documents_from_pdf(local_pdf)
-            text_chunks = get_text_chunks_from_documents(documents)
-            chunk_texts = [chunk.page_content for chunk in text_chunks]
-            chunk_metadata = [ {"source_page": chunk.metadata.get("source_page", "Unknown"), "text": chunk.page_content} for chunk in text_chunks ]
-            try:
-                chunk_embeddings = embeddings.embed_documents(chunk_texts)
-                index, _ = build_faiss_index(chunk_embeddings)
-                save_faiss_index(index, chunk_metadata, pdf_hash)
-                metadata = chunk_metadata
-            except Exception as e:
-                print(f"Rebuild embeddings after missing chunk texts failed: {e}")
-                return {"answers": ["Embedding rebuild failed."] * len(questions)}
-
-    # If metadata lacks chunk text, ensure metadata now contains text fields for later context assembly
-    if metadata and isinstance(metadata, list) and "text" not in metadata[0]:
-        # attach chunk text to metadata based on currently available chunk_texts
-        if len(metadata) == len(chunk_texts):
-            for i, m in enumerate(metadata):
-                m["text"] = chunk_texts[i]
-
-    # 4) For each question: embed query, search FAISS, collect top chunks, ask LLM
-    final_simple_answers = []
-    for question in questions:
-        # try to extract query topic for better retrieval
-        transformed_query = llm_parser_extract_query_topic(question)
-        try:
-            q_emb = embeddings.embed_query(transformed_query)
-        except Exception as e:
-            print(f"Query embedding failed for transformed query; embedding original question. Error: {e}")
-            q_emb = embeddings.embed_query(question)
-
-        top_k = min(5, len(metadata))
-        try:
-            idxs, scores = search_faiss(index, q_emb, top_k=top_k)
-        except Exception as e:
-            print(f"FAISS search error: {e}")
-            idxs, scores = [], []
-
-        retrieved_context = {}
-        for i in idxs:
-            if i < 0 or i >= len(metadata):
-                continue
-            meta = metadata[i]
-            page = meta.get("source_page", "Unknown")
-            text = meta.get("text") or (chunk_texts[i] if i < len(chunk_texts) else "")
-            if page not in retrieved_context:
-                retrieved_context[page] = []
-            retrieved_context[page].append(text)
-
-        context_json_str = json.dumps(retrieved_context, indent=2)
-        structured = generate_structured_answer(context_json_str, question)
-        final_simple_answers.append(structured.get("answer", "Information not found."))
-
-    final_response = {"answers": final_simple_answers}
-
-    # 5) Save to DB cache
-    try:
-        save_to_cache(cache_key, pdf_url_normalized, file_name, final_response)
-    except Exception as e:
-        print(f"Warning: saving to DB failed: {e}")
-
-    return final_response
+    return answer_pdf_questions(pdf_url, questions)
