@@ -1,5 +1,5 @@
 """
-logic.py
+logic.py cache logic
 
 - Preprocess PDF -> build FAISS index (persisted to disk)
 - Query endpoint uses existing FAISS index to retrieve context and call Gemini LLM
