@@ -1,16 +1,16 @@
 # Core logic dependencies
-langchain==0.1.17
-langchain-google-genai==0.0.10
-python-dotenv==1.0.1
-PyMuPDF==1.24.3       # used instead of PyPDF2 (your code uses `fitz`)
-faiss-cpu==1.7.4.post1
-requests==2.31.0
-numpy==1.26.4
+langchain
+langchain-google-genai
+python-dotenv
+PyMuPDF
+faiss-cpu
+requests
+numpy
 
 # FastAPI server dependencies
-fastapi==0.110.2
-uvicorn[standard]==0.29.0
-pydantic==1.10.14     # or match FastAPI version, don't mix with v2 unless upgraded across stack
+fastapi
+uvicorn[standard]
+pydantic
 
-# Optional (for CLI or local testing)
+# Optional CLI support (used in logic.py main block)
 argparse
